@@ -12,3 +12,5 @@
 ## 📌 Project Overview
 
 This repository contains the full engineering pipeline for processing, feature extraction, and neural classification of auscultation audio recordings. The system isolates breathing cycle signals to automatically detect adventitious respiratory sounds (specifically **wheezes** and **crackles**), providing an objective diagnostic support tool for pulmonary auscultation.
+
+> **Note on Language Conventions:** To align with the B.Sc. engineering thesis requirements, all Jupyter notebooks and analytical documentation are written in Polish. Core Python modules, code comments, and docstrings are written in English.

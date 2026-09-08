@@ -12,11 +12,11 @@ src/respiratory_sound_analysis.egg-info
 
 
 # ==========================================
-# Data, Models etc.
+# Data, Models, Cache etc.
 # ==========================================
 data/
 models/
-
+notebooks/.cache
 
 # ==========================================
 # Editors

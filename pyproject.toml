@@ -9,13 +9,16 @@ authors = [
 ]
 requires-python = ">=3.12"
 dependencies=[
+    "hdbscan>=0.8.44",
     "librosa>=1.0.0",
     "matplotlib>=3.11.1",
     "numpy>=2.5.2",
     "opencv-python>=5.0.0.93",
     "pandas>=3.0.5",
+    "pyarrow>=25.0.1",
     "pyfonts>=1.4.1",
     "pypalettes>=0.2.1",
+    "scikit-bio>=0.7.3",
     "scikit-learn>=1.9.0",
     "seaborn>=0.13.2",
     "statsmodels>=0.15.0",
@@ -24,6 +27,7 @@ dependencies=[
     "torchvision>=0.26.0",
     "tqdm>=4.70.0",
     "ultralytics>=8.4.136",
+    "umap-learn>=0.5.12",
 ]
 
 [tool.uv]

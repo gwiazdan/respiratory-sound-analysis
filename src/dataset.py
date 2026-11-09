@@ -1,7 +1,5 @@
 from pathlib import Path
-
 import librosa
-
 import numpy as np
 import pandas as pd
 import pyarrow as pa
@@ -11,35 +9,94 @@ from itertools import chain
 from datetime import datetime
 from sklearn.model_selection import GroupShuffleSplit
 
+
 class Dataset:
     def __init__(self, dataset_path, cache_path=None):
         self.dataset_path = Path(dataset_path)
-        if cache_path is not None:
-            self.cache_path = Path(cache_path)
-        else:
-            self.cache_path = cache_path
+        self.cache_path = Path(cache_path) if cache_path is not None else None
         self.df = None
 
     def _get_cache(self):
-            table = pq.read_table(self.cache_path)
-            df = table.to_pandas()
-            self.df = df
+        table = pq.read_table(self.cache_path)
+        self.df = table.to_pandas()
     
     def _cache_df(self):
-        table = pa.Table.from_pandas(self.df) 
-        pq.write_table(table, self.cache_path)
+        if self.cache_path is not None:
+            self.cache_path.parent.mkdir(parents=True, exist_ok=True)
+            table = pa.Table.from_pandas(self.df) 
+            pq.write_table(table, self.cache_path)
 
-    def get_df(self, unified=True):
-        if self.cache_path is None:
-            self._load_dataset()
+    def _get_features(self):
+        if self.cache_path is not None:
+            self.cache_path.parent.mkdir(parents=True, exist_ok=True)
+        
+        rms_dict = {}
+        zcr_dict = {}
+        spectral_centroid_dict = {}
+        spectral_flatness_dict = {}
+        spectral_rolloff_dict = {}
+        spectral_bandwidth_dict = {}
+        crest_factor_dict = {}
+
+        for wav_path in self.df['wav_path'].unique():
+            y, sr = librosa.load(wav_path, sr=None)
+            
+            cycles_for_file = self.df[self.df['wav_path'] == wav_path]
+            
+            for cycle in cycles_for_file.itertuples():
+                idx = cycle.Index
+                
+                start_sample = int(cycle.start * sr)
+                end_sample = int(cycle.end * sr)
+                
+                y_cycle = y[start_sample:end_sample]
+                
+                if len(y_cycle) == 0:
+                    continue
+
+                rms = np.mean(librosa.feature.rms(y=y_cycle))
+                rms_dict[idx] = rms
+                zcr_dict[idx] = np.mean(librosa.feature.zero_crossing_rate(y=y_cycle))
+                crest_factor_dict[idx] = np.max(np.abs(y_cycle)) / (rms + 1e-8)
+
+                spectral_centroid_dict[idx] = np.mean(librosa.feature.spectral_centroid(y=y_cycle, sr=sr))
+                spectral_bandwidth_dict[idx] = np.mean(librosa.feature.spectral_bandwidth(y=y_cycle, sr=sr))
+                spectral_rolloff_dict[idx] = np.mean(librosa.feature.spectral_rolloff(y=y_cycle, sr=sr, roll_percent=0.85))
+                spectral_flatness_dict[idx] = np.mean(librosa.feature.spectral_flatness(y=y_cycle))
+
+        self.df = self.df.copy()
+        self.df['audio_rms'] = self.df.index.map(rms_dict)
+        self.df['audio_zcr'] = self.df.index.map(zcr_dict)
+        self.df['crest_factor'] = self.df.index.map(crest_factor_dict)
+        self.df['spectral_centroid'] = self.df.index.map(spectral_centroid_dict)
+        self.df['spectral_bandwidth'] = self.df.index.map(spectral_bandwidth_dict)
+        self.df['spectral_rolloff'] = self.df.index.map(spectral_rolloff_dict)
+        self.df['spectral_flatness'] = self.df.index.map(spectral_flatness_dict)
+
+    def get_df(self, unified=True, extract_features=False):
+        if self.cache_path is not None and self.cache_path.exists():
+            self._get_cache()
         else:
-            if self.cache_path.exists():
-                self._get_cache()
-            else:
-                self._load_dataset()
-                self._cache_df()
+            self._load_dataset()
+            self._cache_df()
+
+        feature_cols = [
+            'audio_rms', 'audio_zcr', 'crest_factor', 
+            'spectral_centroid', 'spectral_bandwidth', 
+            'spectral_rolloff', 'spectral_flatness'
+        ]
+        
+        has_features = all(col in self.df.columns for col in feature_cols)
+
+        if extract_features and not has_features:
+            self._get_features()
+            self._cache_df()
+
         if unified:
-            return self._unify()
+            return self._unify(extract_features=extract_features)
+        
+        if not extract_features:
+            return self.df.drop(columns=[col for col in feature_cols if col in self.df.columns], errors='ignore')
         return self.df
 
     def get_train_test(self):
@@ -48,7 +105,7 @@ class Dataset:
     def _load_dataset(self):
         raise NotImplementedError()
 
-    def _unify(self):
+    def _unify(self, extract_features=False):
         raise NotImplementedError()
 
     def load_audio(self, record, sr=None):
@@ -82,6 +139,7 @@ class Dataset:
 
         return librosa.load(wav_path, sr=sr, offset=offset, duration=duration)
 
+
 class SPRSoundDataset(Dataset):
 
     def _load_dataset(self):
@@ -95,7 +153,6 @@ class SPRSoundDataset(Dataset):
                 with open(json_file, 'r', encoding='utf-8') as f:
                     try:
                         data = json.load(f)
-
                         events = data['event_annotation'] 
                         
                         for event in events:
@@ -118,16 +175,21 @@ class SPRSoundDataset(Dataset):
             df_encoded = pd.get_dummies(df, columns=['event_type'], prefix='', prefix_sep='')
             self.df = df_encoded
 
-    def _unify(self):
+    def _unify(self, extract_features=False):
         self.df['crackles'] = self.df[['fine crackle', 'coarse crackle', 'wheeze+crackle']].any(axis=1)
         self.df['wheezes'] = self.df[['wheeze', 'rhonchi', 'stridor', 'wheeze+crackle']].any(axis=1)
         self.df = self.df[self.df['chest_location'].isin(['p1', 'p2', 'p3', 'p4'])]
 
         columns = ['start','end','filename','wav_path','patient_id','patient_age','patient_gender','chest_location','wheezes','crackles']
+        feature_cols = ['audio_rms', 'audio_zcr', 'crest_factor', 'spectral_centroid', 'spectral_bandwidth', 'spectral_rolloff', 'spectral_flatness']
+        
+        if extract_features:
+            existing_features = [col for col in feature_cols if col in self.df.columns]
+            return self.df[columns + existing_features]
         return self.df[columns]
 
-    def get_train_test(self, split=0.7, random_state=42):
-        df = self.get_df(unified=True)
+    def get_train_test(self, split=0.7, random_state=42, extract_features=False):
+        df = self.get_df(unified=True, extract_features=extract_features)
             
         gss = GroupShuffleSplit(n_splits=1, train_size=split, random_state=random_state)
         train_idx, test_idx = next(gss.split(df, groups=df['patient_id']))
@@ -183,11 +245,14 @@ class ICBHIDataset(Dataset):
             df = pd.merge(df, merged_metadata, on="filename", how="left")
             self.df = df
     
-    def _unify(self):
+    def _unify(self, extract_features=False):
+        feature_cols = ['audio_rms', 'audio_zcr', 'crest_factor', 'spectral_centroid', 'spectral_bandwidth', 'spectral_rolloff', 'spectral_flatness']
+        if not extract_features:
+            return self.df.drop(columns=[col for col in feature_cols if col in self.df.columns], errors='ignore')
         return self.df
 
-    def get_train_test(self, split=0.7, random_state=42):
-        df = self.get_df(unified=True)
+    def get_train_test(self, split=0.7, random_state=42, extract_features=False):
+        df = self.get_df(unified=True, extract_features=extract_features)
             
         gss = GroupShuffleSplit(n_splits=1, train_size=split, random_state=random_state)
         train_idx, test_idx = next(gss.split(df, groups=df['patient_id']))
@@ -196,6 +261,7 @@ class ICBHIDataset(Dataset):
         test_df = df.iloc[test_idx].reset_index(drop=True)
         
         return train_df, test_df
+
 
 class HFLungSoundDataset(Dataset):
     def __init__(self, dataset_path, cache_path=None):
@@ -226,7 +292,6 @@ class HFLungSoundDataset(Dataset):
             filename_stem = file.stem
             parts = filename_stem.split("_")
             
-            # Określenie, czy plik należy do train, czy test na podstawie struktury ścieżki
             split_val = "train" if "train" in file.parts else "test"
 
             if file.suffix == ".wav":
@@ -364,7 +429,7 @@ class HFLungSoundDataset(Dataset):
         else:
             self.df = pd.DataFrame()
 
-    def _unify(self):
+    def _unify(self, extract_features=False):
         self.df['crackles'] = self.df[['crackles']].any(axis=1)
         self.df['wheezes'] = self.df[['wheezes', 'rhonchi', 'stridor']].any(axis=1)
         columns = [
@@ -372,10 +437,72 @@ class HFLungSoundDataset(Dataset):
             'recording_equipment', 'date', 'truncation', 
             'chest_location', 'split', 'wheezes', 'crackles'
         ]
+        feature_cols = ['audio_rms', 'audio_zcr', 'crest_factor', 'spectral_centroid', 'spectral_bandwidth', 'spectral_rolloff', 'spectral_flatness']
+        
+        if extract_features:
+            existing_features = [col for col in feature_cols if col in self.df.columns]
+            return self.df[columns + existing_features]
         return self.df[columns]
 
-    def get_train_test(self):
-        train_df = self.df[self.df['split'] == 'train'].drop(columns=['split'])
-        test_df = self.df[self.df['split'] == 'test'].drop(columns=['split'])
+    def get_train_test(self, extract_features=False):
+        df = self.get_df(unified=True, extract_features=extract_features)
+        
+        train_df = df[df['split'] == 'train'].drop(columns=['split'], errors='ignore')
+        test_df = df[df['split'] == 'test'].drop(columns=['split'], errors='ignore')
         
         return train_df, test_df
+
+
+def transform_spr(df):
+    df = df.copy()
+    df['dataset_source'] = 'SPRSound'
+    base_cols = ['start', 'end', 'filename', 'wav_path', 'chest_location', 'wheezes', 'crackles', 'dataset_source']
+    feature_cols = [c for c in df.columns if c not in base_cols]
+    return df[base_cols + feature_cols]
+
+def transform_icbhi(df):
+    df = df.copy()
+    df['dataset_source'] = 'ICBHI'
+    if 'chest_location' not in df.columns:
+        df['chest_location'] = None
+    return df
+
+def transform_hf(df):
+    df = df.copy()
+    df['dataset_source'] = 'HFLung'
+    base_cols = ['start', 'end', 'filename', 'wav_path', 'chest_location', 'wheezes', 'crackles', 'dataset_source']
+    feature_cols = [c for c in df.columns if c not in base_cols]
+    return df[base_cols + feature_cols]
+
+
+def get_train_test(dataset1, dataset2, dataset3, split=0.7, random_state=42, extract_features=False):
+    train_list = []
+    test_list = []
+
+    datasets = [dataset1, dataset2, dataset3]
+    
+    for dataset in datasets:
+        if isinstance(dataset, HFLungSoundDataset):
+            train, test = dataset.get_train_test(extract_features=extract_features)
+        else:
+            train, test = dataset.get_train_test(split=split, random_state=random_state, extract_features=extract_features)
+        
+        if isinstance(dataset, SPRSoundDataset):
+            train_transformed = transform_spr(train)
+            test_transformed = transform_spr(test)
+        elif isinstance(dataset, ICBHIDataset):
+            train_transformed = transform_icbhi(train)
+            test_transformed = transform_icbhi(test)
+        elif isinstance(dataset, HFLungSoundDataset):
+            train_transformed = transform_hf(train)
+            test_transformed = transform_hf(test)
+        else:
+            raise TypeError(f"Nieznany typ datasetu: {type(dataset)}")
+            
+        train_list.append(train_transformed)
+        test_list.append(test_transformed)
+
+    combined_train = pd.concat(train_list, ignore_index=True)
+    combined_test = pd.concat(test_list, ignore_index=True)
+
+    return combined_train, combined_test

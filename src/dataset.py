@@ -57,9 +57,7 @@ class Dataset:
                 def compute_stats(arr, prefix):
                     return {
                         f"{prefix}_mean": float(np.mean(arr)),
-                        f"{prefix}_std": float(np.std(arr)),
-                        f"{prefix}_min": float(np.min(arr)),
-                        f"{prefix}_max": float(np.max(arr))
+                        f"{prefix}_std": float(np.std(arr))
                     }
 
                 rms_arr = librosa.feature.rms(y=y_cycle, frame_length=n_fft, hop_length=hop_length)
@@ -203,10 +201,10 @@ class SPRSoundDataset(Dataset):
 
     def _unify(self, extract_features=False):
         self.df['crackles'] = self.df[['fine crackle', 'coarse crackle', 'wheeze+crackle']].any(axis=1)
-        self.df['wheezes'] = self.df[['wheeze', 'rhonchi', 'stridor', 'wheeze+crackle']].any(axis=1)
-        self.df = self.df[self.df['chest_location'].isin(['p1', 'p2', 'p3', 'p4'])]
+        self.df['wheezes'] = self.df[['wheeze', 'stridor', 'wheeze+crackle']].any(axis=1)
+        #self.df = self.df[self.df['chest_location'].isin(['p1', 'p2', 'p3', 'p4'])]
 
-        columns = ['start','end','filename','wav_path','patient_id','patient_age','patient_gender','chest_location','wheezes','crackles']
+        columns = ['start','end','filename','wav_path','patient_id','patient_age','patient_gender','chest_location','wheezes','crackles', 'rhonchi']
         
         if extract_features:
             feature_cols = [c for c in self.df.columns if c.startswith(('audio_', 'spectral_', 'mfcc_')) or c == 'crest_factor']
@@ -458,11 +456,11 @@ class HFLungSoundDataset(Dataset):
 
     def _unify(self, extract_features=False):
         self.df['crackles'] = self.df[['crackles']].any(axis=1)
-        self.df['wheezes'] = self.df[['wheezes', 'rhonchi', 'stridor']].any(axis=1)
+        self.df['wheezes'] = self.df[['wheezes', 'stridor']].any(axis=1)
         columns = [
             'start', 'end', 'filename', 'wav_path', 
             'recording_equipment', 'date', 'truncation', 
-            'chest_location', 'split', 'wheezes', 'crackles'
+            'chest_location', 'split', 'wheezes', 'crackles', 'rhonchi'
         ]
         
         if extract_features:

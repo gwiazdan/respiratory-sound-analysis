@@ -10,6 +10,7 @@ authors = [
 requires-python = ">=3.12"
 dependencies=[
     "hdbscan>=0.8.44",
+    "joblib>=1.6.0",
     "librosa>=1.0.0",
     "matplotlib>=3.11.1",
     "numpy>=2.5.2",

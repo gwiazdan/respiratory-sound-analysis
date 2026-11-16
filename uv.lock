@@ -2983,6 +2983,7 @@ version = "0.0.1"
 source = { editable = "." }
 dependencies = [
     { name = "hdbscan" },
+    { name = "joblib" },
     { name = "librosa" },
     { name = "matplotlib" },
     { name = "numpy" },
@@ -3019,6 +3020,7 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "hdbscan", specifier = ">=0.8.44" },
+    { name = "joblib", specifier = ">=1.6.0" },
     { name = "librosa", specifier = ">=1.0.0" },
     { name = "matplotlib", specifier = ">=3.11.1" },
     { name = "numpy", specifier = ">=2.5.2" },

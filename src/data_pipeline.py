@@ -4,6 +4,7 @@ import hashlib
 import json
 from collections.abc import Callable, Hashable
 from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
 from typing import Protocol, Self, cast
 
@@ -12,7 +13,9 @@ import numpy as np
 import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
+import soundfile as sf
 from joblib import Parallel, delayed
+from scipy.signal import resample_poly
 
 from src.dataset import Dataset
 
@@ -26,7 +29,153 @@ class DataFrameTransformer(Protocol):
 
 
 SchemaTransformer = DataFrameTransformer | Callable[[pd.DataFrame], pd.DataFrame]
+AudioProcessor = Callable[[np.ndarray], np.ndarray]
 Record = int | np.integer | pd.Series | dict[str, object]
+
+
+@lru_cache(maxsize=16)
+def _mel_filterbank(sample_rate: int, n_fft: int) -> np.ndarray:
+    return librosa.filters.mel(
+        sr=sample_rate,
+        n_fft=n_fft,
+        n_mels=128,
+        fmin=0.0,
+        fmax=None,
+        htk=False,
+        norm="slaney",
+        dtype=np.float32,
+    )
+
+
+@lru_cache(maxsize=16)
+def _dct_basis(n_mfcc: int, n_mels: int) -> np.ndarray:
+    mel_indices = np.arange(n_mels, dtype=np.float32)
+    coefficient_indices = np.arange(n_mfcc, dtype=np.float32)[:, None]
+    basis = np.cos(np.pi / n_mels * (mel_indices + 0.5) * coefficient_indices)
+    basis[0] *= np.sqrt(1 / n_mels)
+    basis[1:] *= np.sqrt(2 / n_mels)
+    return basis.astype(np.float32, copy=False)
+
+
+@lru_cache(maxsize=16)
+def _fft_frequencies(sample_rate: int, n_fft: int) -> np.ndarray:
+    return np.fft.rfftfreq(n_fft, 1 / sample_rate).astype(np.float32)
+
+
+def _load_feature_audio(
+    wav_path: str,
+    target_sample_rate: int,
+    audio_preprocessor: AudioProcessor | None = None,
+) -> tuple[np.ndarray, int]:
+    audio, sample_rate = sf.read(wav_path, dtype="float32", always_2d=False)
+    if audio.ndim == 2:
+        audio = np.mean(audio, axis=1, dtype=np.float32)
+    audio = np.asarray(audio, dtype=np.float32)
+    if sample_rate != target_sample_rate:
+        audio = resample_poly(audio, target_sample_rate, sample_rate)
+
+    audio = np.asarray(audio, dtype=np.float32)
+    return _apply_audio_preprocessor(audio, audio_preprocessor), target_sample_rate
+
+
+def _apply_audio_preprocessor(
+    audio: np.ndarray,
+    audio_preprocessor: AudioProcessor | None,
+) -> np.ndarray:
+    if audio_preprocessor is None:
+        return audio
+    processed = np.asarray(audio_preprocessor(audio))
+    if processed.ndim != 1:
+        raise ValueError("An audio preprocessor must return a one-dimensional signal.")
+    return processed
+
+
+def _extract_file_features(
+    wav_path: str,
+    cycles: list[tuple[object, float, float]],
+    feature_sample_rate: int,
+    audio_preprocessor: AudioProcessor | None,
+) -> list[dict[str, object]]:
+    full_audio, sample_rate = _load_feature_audio(
+        wav_path,
+        feature_sample_rate,
+        audio_preprocessor,
+    )
+    features: list[dict[str, object]] = []
+    for index, start, end in cycles:
+        start_sample = int(start * sample_rate)
+        end_sample = int(end * sample_rate)
+        audio = full_audio[start_sample:end_sample]
+        if len(audio) < 128:
+            features.append({"index": index})
+            continue
+        features.append(_extract_cycle_features(audio, sample_rate, index))
+    return features
+
+
+def _extract_cycle_features(
+    audio: np.ndarray,
+    sample_rate: int,
+    index: object,
+) -> dict[str, object]:
+    n_fft = max(64, min(2048, 2 ** int(np.floor(np.log2(len(audio))))))
+    hop_length = max(1, n_fft // 4)
+
+    def stats(values: np.ndarray, prefix: str) -> dict[str, float]:
+        return {
+            f"{prefix}_mean": float(np.mean(values)),
+            f"{prefix}_std": float(np.std(values)),
+        }
+
+    rms = librosa.feature.rms(y=audio, frame_length=n_fft, hop_length=hop_length)
+    zcr = librosa.feature.zero_crossing_rate(
+        y=audio,
+        frame_length=n_fft,
+        hop_length=hop_length,
+    )
+    rms_mean = float(np.mean(rms))
+    features: dict[str, object] = {
+        "index": index,
+        "crest_factor": float(np.max(np.abs(audio)) / (rms_mean + 1e-8)),
+    }
+    features.update(stats(rms, "audio_rms"))
+    features.update(stats(zcr, "audio_zcr"))
+
+    stft_mag = np.abs(librosa.stft(audio, n_fft=n_fft, hop_length=hop_length)).astype(
+        np.float32,
+        copy=False,
+    )
+    frequencies = _fft_frequencies(sample_rate, n_fft)[:, None]
+    magnitude_sum = np.sum(stft_mag, axis=0)
+    safe_magnitude_sum = np.maximum(magnitude_sum, np.finfo(np.float32).tiny)
+    centroid = np.sum(frequencies * stft_mag, axis=0) / safe_magnitude_sum
+    bandwidth = np.sqrt(
+        np.sum(((frequencies - centroid) ** 2) * stft_mag, axis=0) / safe_magnitude_sum
+    )
+    rolloff_threshold = 0.85 * magnitude_sum
+    cumulative_magnitude = np.cumsum(stft_mag, axis=0)
+    rolloff_bins = np.argmax(cumulative_magnitude >= rolloff_threshold, axis=0)
+    rolloff = _fft_frequencies(sample_rate, n_fft)[rolloff_bins]
+    safe_power = np.maximum(stft_mag**2, 1e-10)
+    flatness = np.exp(np.mean(np.log(safe_power), axis=0)) / np.mean(
+        safe_power,
+        axis=0,
+    )
+    spectral_features = {
+        "spectral_centroid": centroid,
+        "spectral_bandwidth": bandwidth,
+        "spectral_rolloff": rolloff,
+        "spectral_flatness": flatness,
+    }
+    for name, values in spectral_features.items():
+        features.update(stats(values, name))
+
+    mel_spec = _mel_filterbank(sample_rate, n_fft) @ (stft_mag**2)
+    mfcc = _dct_basis(13, mel_spec.shape[0]) @ librosa.power_to_db(mel_spec)
+    for coefficient, values in enumerate(mfcc):
+        features[f"mfcc_{coefficient}_mean"] = float(np.mean(values))
+        features[f"mfcc_{coefficient}_std"] = float(np.std(values))
+    return features
 
 
 @dataclass(frozen=True)
@@ -39,6 +188,7 @@ class MultiDatasetPipelineBuilder:
     """Build train/test dataframes from multiple dataset sources."""
 
     FEATURE_SAMPLE_RATE = 4000
+    _FEATURE_EXTRACTION_VERSION = 2
     _MANIFEST_NAME = "manifest.json"
     _ALL_DATASET_NAME = "all.parquet"
     _FEATURE_DATASET_NAME = "all_features.parquet"
@@ -56,8 +206,15 @@ class MultiDatasetPipelineBuilder:
         "acquisition_mode",
     )
 
-    def __init__(self, cache_path: str | Path | None = None) -> None:
+    def __init__(
+        self,
+        cache_path: str | Path | None = None,
+        cache_suffix: str | None = None,
+        audio_preprocessor: AudioProcessor | None = None,
+    ) -> None:
         self.cache_path = Path(cache_path) if cache_path is not None else None
+        self.cache_suffix = cache_suffix or ""
+        self.audio_preprocessor = audio_preprocessor
         self._sources: list[_DatasetSource] = []
         self._transformers: list[DataFrameTransformer] = []
         self._train_df: pd.DataFrame | None = None
@@ -124,7 +281,7 @@ class MultiDatasetPipelineBuilder:
         if self.cache_path is not None and not force_recompute:
             cache_key = self._cache_key(split, random_state)
             if self._cached_artifact_matches(self._ALL_DATASET_NAME, cache_key):
-                return pq.read_table(self.cache_path / self._ALL_DATASET_NAME).to_pandas()
+                return pq.read_table(self._artifact_path(self._ALL_DATASET_NAME)).to_pandas()
 
         train_df, test_df = self.build_train_test(
             split=split,
@@ -160,7 +317,7 @@ class MultiDatasetPipelineBuilder:
             and not force_recompute
             and self._cached_artifact_matches(self._FEATURE_DATASET_NAME, cache_key)
         ):
-            return pq.read_table(self.cache_path / self._FEATURE_DATASET_NAME).to_pandas()
+            return pq.read_table(self._artifact_path(self._FEATURE_DATASET_NAME)).to_pandas()
 
         train_df, test_df = self.build_train_test_with_features(
             split=split,
@@ -203,8 +360,13 @@ class MultiDatasetPipelineBuilder:
             random_state=random_state,
             force_recompute=force_recompute,
         )
-        train_features = self._extract_features(train_df, n_jobs=n_jobs)
-        test_features = self._extract_features(test_df, n_jobs=n_jobs)
+        train_length = len(train_df)
+        combined_features = self._extract_features(
+            pd.concat([train_df, test_df], ignore_index=True),
+            n_jobs=n_jobs,
+        )
+        train_features = combined_features.iloc[:train_length].reset_index(drop=True)
+        test_features = combined_features.iloc[train_length:].reset_index(drop=True)
 
         self._train_df = train_features
         self._test_df = test_features
@@ -248,11 +410,14 @@ class MultiDatasetPipelineBuilder:
         sr: int | None = None,
         dataframe: pd.DataFrame | None = None,
     ) -> tuple[np.ndarray, int]:
-        """Load a complete recording identified by a row or row index."""
+        """Load and optionally preprocess a complete recording."""
         resolved_record = self.resolve(record, dataframe)
         wav_path = cast(str, resolved_record["wav_path"])
-        audio, sample_rate = librosa.load(wav_path, sr=sr)
-        return audio, int(sample_rate)
+        target_sample_rate = sr
+        if target_sample_rate is None and self.audio_preprocessor is not None:
+            target_sample_rate = self._preprocessor_sample_rate()
+        audio, sample_rate = librosa.load(wav_path, sr=target_sample_rate)
+        return _apply_audio_preprocessor(audio, self.audio_preprocessor), int(sample_rate)
 
     def load_audio_fragment(
         self,
@@ -262,7 +427,7 @@ class MultiDatasetPipelineBuilder:
         sr: int | None = None,
         dataframe: pd.DataFrame | None = None,
     ) -> tuple[np.ndarray, int]:
-        """Load a recording fragment identified by a row and time bounds."""
+        """Load a recording fragment, preprocessing the full recording first when configured."""
         resolved_record = self.resolve(record, dataframe)
         wav_path = cast(str, resolved_record["wav_path"])
 
@@ -274,6 +439,16 @@ class MultiDatasetPipelineBuilder:
         resolved_end = float(raw_end) if raw_end is not None else None
         duration = resolved_end - resolved_start if resolved_end is not None else None
 
+        if self.audio_preprocessor is not None:
+            processed_audio, processed_sample_rate = self.load_audio(resolved_record, sr=sr)
+            start_sample = int(resolved_start * processed_sample_rate)
+            end_sample = (
+                int(resolved_end * processed_sample_rate)
+                if resolved_end is not None
+                else len(processed_audio)
+            )
+            return processed_audio[start_sample:end_sample], processed_sample_rate
+
         audio, sample_rate = librosa.load(
             wav_path,
             sr=sr,
@@ -281,6 +456,10 @@ class MultiDatasetPipelineBuilder:
             duration=duration,
         )
         return audio, int(sample_rate)
+
+    def _preprocessor_sample_rate(self) -> int | None:
+        sample_rate = getattr(self.audio_preprocessor, "sr", None)
+        return int(sample_rate) if sample_rate is not None else None
 
     def _cache_exists(self, cache_key: str) -> bool:
         if self.cache_path is None:
@@ -293,8 +472,8 @@ class MultiDatasetPipelineBuilder:
         if self.cache_path is None:
             raise RuntimeError("Cache path is not configured.")
 
-        train_df = pq.read_table(self.cache_path / "train.parquet").to_pandas()
-        test_df = pq.read_table(self.cache_path / "test.parquet").to_pandas()
+        train_df = pq.read_table(self._artifact_path("train.parquet")).to_pandas()
+        test_df = pq.read_table(self._artifact_path("test.parquet")).to_pandas()
         self._train_df = train_df
         self._test_df = test_df
         return train_df, test_df
@@ -305,8 +484,8 @@ class MultiDatasetPipelineBuilder:
         if self.cache_path is None:
             raise RuntimeError("Cache path is not configured.")
 
-        train_df = pq.read_table(self.cache_path / self._TRAIN_FEATURES_NAME).to_pandas()
-        test_df = pq.read_table(self.cache_path / self._TEST_FEATURES_NAME).to_pandas()
+        train_df = pq.read_table(self._artifact_path(self._TRAIN_FEATURES_NAME)).to_pandas()
+        test_df = pq.read_table(self._artifact_path(self._TEST_FEATURES_NAME)).to_pandas()
         self._train_df = train_df
         self._test_df = test_df
         return train_df, test_df
@@ -322,10 +501,12 @@ class MultiDatasetPipelineBuilder:
 
         self.cache_path.mkdir(parents=True, exist_ok=True)
         pq.write_table(
-            pa.Table.from_pandas(train_df, preserve_index=False), self.cache_path / "train.parquet"
+            pa.Table.from_pandas(train_df, preserve_index=False),
+            self._artifact_path("train.parquet"),
         )
         pq.write_table(
-            pa.Table.from_pandas(test_df, preserve_index=False), self.cache_path / "test.parquet"
+            pa.Table.from_pandas(test_df, preserve_index=False),
+            self._artifact_path("test.parquet"),
         )
         self._write_manifest("train.parquet", cache_key)
         self._write_manifest("test.parquet", cache_key)
@@ -338,20 +519,21 @@ class MultiDatasetPipelineBuilder:
     def _extract_features(self, dataframe: pd.DataFrame, n_jobs: int) -> pd.DataFrame:
         grouped_cycles: list[tuple[str, list[tuple[Hashable, float, float]]]] = []
         for wav_path, group in dataframe.groupby("wav_path", sort=False):
-            cycles = [
-                (
-                    index,
-                    cast(float, row["start"]),
-                    cast(float, row["end"]),
-                )
-                for index, row in group.iterrows()
-            ]
+            indices = group.index.to_numpy()
+            starts = group["start"].to_numpy(dtype=float, copy=False)
+            ends = group["end"].to_numpy(dtype=float, copy=False)
+            cycles = list(zip(indices, starts, ends, strict=True))
             grouped_cycles.append((cast(str, wav_path), cycles))
 
         grouped_features = cast(
             list[list[dict[str, object]]],
             Parallel(n_jobs=n_jobs)(
-                delayed(self._extract_file_features)(wav_path, cycles)
+                delayed(_extract_file_features)(
+                    wav_path,
+                    cycles,
+                    self.FEATURE_SAMPLE_RATE,
+                    self.audio_preprocessor,
+                )
                 for wav_path, cycles in grouped_cycles
             ),
         )
@@ -365,95 +547,6 @@ class MultiDatasetPipelineBuilder:
         if feature_columns:
             result = result.drop(columns=feature_columns)
         return result.join(feature_dataframe, how="left")
-
-    def _extract_file_features(
-        self,
-        wav_path: str,
-        cycles: list[tuple[object, float, float]],
-    ) -> list[dict[str, object]]:
-        full_audio, sample_rate = librosa.load(
-            wav_path,
-            sr=self.FEATURE_SAMPLE_RATE,
-            mono=True,
-        )
-        sample_rate = int(sample_rate)
-        features: list[dict[str, object]] = []
-        for index, start, end in cycles:
-            start_sample = int(start * sample_rate)
-            end_sample = int(end * sample_rate)
-            audio = full_audio[start_sample:end_sample]
-            if len(audio) < 128:
-                features.append({"index": index})
-                continue
-            features.append(self._extract_cycle_features(audio, sample_rate, index))
-        return features
-
-    @staticmethod
-    def _extract_cycle_features(
-        audio: np.ndarray,
-        sample_rate: int,
-        index: object,
-    ) -> dict[str, object]:
-        n_fft = max(64, min(2048, 2 ** int(np.floor(np.log2(len(audio))))))
-        hop_length = max(1, n_fft // 4)
-
-        def stats(values: np.ndarray, prefix: str) -> dict[str, float]:
-            return {
-                f"{prefix}_mean": float(np.mean(values)),
-                f"{prefix}_std": float(np.std(values)),
-            }
-
-        rms = librosa.feature.rms(y=audio, frame_length=n_fft, hop_length=hop_length)
-        zcr = librosa.feature.zero_crossing_rate(
-            y=audio,
-            frame_length=n_fft,
-            hop_length=hop_length,
-        )
-        rms_mean = float(np.mean(rms))
-        features: dict[str, object] = {
-            "index": index,
-            "crest_factor": float(np.max(np.abs(audio)) / (rms_mean + 1e-8)),
-        }
-        features.update(stats(rms, "audio_rms"))
-        features.update(stats(zcr, "audio_zcr"))
-
-        stft_mag = np.abs(librosa.stft(audio, n_fft=n_fft, hop_length=hop_length))
-        spectral_features = {
-            "spectral_centroid": librosa.feature.spectral_centroid(
-                S=stft_mag, sr=sample_rate, n_fft=n_fft, hop_length=hop_length
-            ),
-            "spectral_bandwidth": librosa.feature.spectral_bandwidth(
-                S=stft_mag, sr=sample_rate, n_fft=n_fft, hop_length=hop_length
-            ),
-            "spectral_rolloff": librosa.feature.spectral_rolloff(
-                S=stft_mag,
-                sr=sample_rate,
-                n_fft=n_fft,
-                hop_length=hop_length,
-                roll_percent=0.85,
-            ),
-            "spectral_flatness": librosa.feature.spectral_flatness(
-                S=stft_mag, n_fft=n_fft, hop_length=hop_length
-            ),
-        }
-        for name, values in spectral_features.items():
-            features.update(stats(values, name))
-
-        mel_spec = librosa.feature.melspectrogram(
-            S=stft_mag**2,
-            sr=sample_rate,
-            n_fft=n_fft,
-            hop_length=hop_length,
-        )
-        mfcc = librosa.feature.mfcc(
-            S=librosa.power_to_db(mel_spec),
-            sr=sample_rate,
-            n_mfcc=13,
-        )
-        for coefficient, values in enumerate(mfcc):
-            features[f"mfcc_{coefficient}_mean"] = float(np.mean(values))
-            features[f"mfcc_{coefficient}_std"] = float(np.std(values))
-        return features
 
     def _cache_key(self, split: float, random_state: int) -> str:
         return self._hash_state(
@@ -470,6 +563,7 @@ class MultiDatasetPipelineBuilder:
                 "base": self._cache_key(split, random_state),
                 "sample_rate": self.FEATURE_SAMPLE_RATE,
                 "n_jobs": n_jobs,
+                "implementation": self._FEATURE_EXTRACTION_VERSION,
             }
         )
 
@@ -483,6 +577,7 @@ class MultiDatasetPipelineBuilder:
                 for source in self._sources
             ],
             "transformers": [self._object_state(transformer) for transformer in self._transformers],
+            "audio_preprocessor": self._object_state(self.audio_preprocessor),
         }
 
     @classmethod
@@ -518,7 +613,14 @@ class MultiDatasetPipelineBuilder:
         return hashlib.sha256(serialized).hexdigest()
 
     def _manifest_path(self) -> Path | None:
-        return self.cache_path / self._MANIFEST_NAME if self.cache_path is not None else None
+        return self._artifact_path(self._MANIFEST_NAME) if self.cache_path is not None else None
+
+    def _artifact_path(self, artifact: str) -> Path:
+        if self.cache_path is None:
+            raise RuntimeError("Cache path is not configured.")
+        artifact_path = Path(artifact)
+        filename = f"{artifact_path.stem}{self.cache_suffix}{artifact_path.suffix}"
+        return self.cache_path / filename
 
     def _cached_artifact_matches(self, artifact: str, cache_key: str) -> bool:
         manifest_path = self._manifest_path()
@@ -528,7 +630,7 @@ class MultiDatasetPipelineBuilder:
         if cache_path is None:
             return False
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-        return manifest.get(artifact) == cache_key and (cache_path / artifact).is_file()
+        return manifest.get(artifact) == cache_key and self._artifact_path(artifact).is_file()
 
     def _write_manifest(self, artifact: str, cache_key: str) -> None:
         manifest_path = self._manifest_path()
@@ -549,7 +651,7 @@ class MultiDatasetPipelineBuilder:
         self.cache_path.mkdir(parents=True, exist_ok=True)
         pq.write_table(
             pa.Table.from_pandas(dataframe, preserve_index=False),
-            self.cache_path / artifact,
+            self._artifact_path(artifact),
         )
         self._write_manifest(artifact, cache_key)
 

@@ -210,11 +210,9 @@ class MultiDatasetPipelineBuilder:
         self,
         cache_path: str | Path | None = None,
         cache_suffix: str | None = None,
-        audio_preprocessor: AudioProcessor | None = None,
     ) -> None:
         self.cache_path = Path(cache_path) if cache_path is not None else None
         self.cache_suffix = cache_suffix or ""
-        self.audio_preprocessor = audio_preprocessor
         self._sources: list[_DatasetSource] = []
         self._transformers: list[DataFrameTransformer] = []
         self._train_df: pd.DataFrame | None = None
@@ -309,9 +307,15 @@ class MultiDatasetPipelineBuilder:
         random_state: int = 42,
         force_recompute: bool = False,
         n_jobs: int = -1,
+        audio_preprocessor: AudioProcessor | None = None,
     ) -> pd.DataFrame:
         """Build the complete dataset and append cached audio features."""
-        cache_key = self._feature_cache_key(split, random_state, n_jobs)
+        cache_key = self._feature_cache_key(
+            split,
+            random_state,
+            n_jobs,
+            audio_preprocessor,
+        )
         if (
             self.cache_path is not None
             and not force_recompute
@@ -324,6 +328,7 @@ class MultiDatasetPipelineBuilder:
             random_state=random_state,
             force_recompute=force_recompute,
             n_jobs=n_jobs,
+            audio_preprocessor=audio_preprocessor,
         )
         result = pd.concat([train_df, test_df], ignore_index=True)
         self._save_cached_dataframe(result, self._FEATURE_DATASET_NAME, cache_key)
@@ -335,9 +340,16 @@ class MultiDatasetPipelineBuilder:
         random_state: int = 42,
         force_recompute: bool = False,
         n_jobs: int = -1,
+        audio_preprocessor: AudioProcessor | None = None,
     ) -> pd.DataFrame:
         """Alias for :meth:`build_dataset_with_features`."""
-        return self.build_dataset_with_features(split, random_state, force_recompute, n_jobs)
+        return self.build_dataset_with_features(
+            split,
+            random_state,
+            force_recompute,
+            n_jobs,
+            audio_preprocessor,
+        )
 
     def build_train_test_with_features(
         self,
@@ -345,9 +357,15 @@ class MultiDatasetPipelineBuilder:
         random_state: int = 42,
         force_recompute: bool = False,
         n_jobs: int = -1,
+        audio_preprocessor: AudioProcessor | None = None,
     ) -> tuple[pd.DataFrame, pd.DataFrame]:
         """Build train/test dataframes and extract features without data leakage."""
-        feature_cache_key = self._feature_cache_key(split, random_state, n_jobs)
+        feature_cache_key = self._feature_cache_key(
+            split,
+            random_state,
+            n_jobs,
+            audio_preprocessor,
+        )
         if (
             not force_recompute
             and self._cached_artifact_matches(self._TRAIN_FEATURES_NAME, feature_cache_key)
@@ -364,6 +382,7 @@ class MultiDatasetPipelineBuilder:
         combined_features = self._extract_features(
             pd.concat([train_df, test_df], ignore_index=True),
             n_jobs=n_jobs,
+            audio_preprocessor=audio_preprocessor,
         )
         train_features = combined_features.iloc[:train_length].reset_index(drop=True)
         test_features = combined_features.iloc[train_length:].reset_index(drop=True)
@@ -409,15 +428,16 @@ class MultiDatasetPipelineBuilder:
         record: Record,
         sr: int | None = None,
         dataframe: pd.DataFrame | None = None,
+        audio_preprocessor: AudioProcessor | None = None,
     ) -> tuple[np.ndarray, int]:
         """Load and optionally preprocess a complete recording."""
         resolved_record = self.resolve(record, dataframe)
         wav_path = cast(str, resolved_record["wav_path"])
         target_sample_rate = sr
-        if target_sample_rate is None and self.audio_preprocessor is not None:
-            target_sample_rate = self._preprocessor_sample_rate()
+        if target_sample_rate is None and audio_preprocessor is not None:
+            target_sample_rate = self._preprocessor_sample_rate(audio_preprocessor)
         audio, sample_rate = librosa.load(wav_path, sr=target_sample_rate)
-        return _apply_audio_preprocessor(audio, self.audio_preprocessor), int(sample_rate)
+        return _apply_audio_preprocessor(audio, audio_preprocessor), int(sample_rate)
 
     def load_audio_fragment(
         self,
@@ -426,6 +446,7 @@ class MultiDatasetPipelineBuilder:
         end: float | None = None,
         sr: int | None = None,
         dataframe: pd.DataFrame | None = None,
+        audio_preprocessor: AudioProcessor | None = None,
     ) -> tuple[np.ndarray, int]:
         """Load a recording fragment, preprocessing the full recording first when configured."""
         resolved_record = self.resolve(record, dataframe)
@@ -439,8 +460,12 @@ class MultiDatasetPipelineBuilder:
         resolved_end = float(raw_end) if raw_end is not None else None
         duration = resolved_end - resolved_start if resolved_end is not None else None
 
-        if self.audio_preprocessor is not None:
-            processed_audio, processed_sample_rate = self.load_audio(resolved_record, sr=sr)
+        if audio_preprocessor is not None:
+            processed_audio, processed_sample_rate = self.load_audio(
+                resolved_record,
+                sr=sr,
+                audio_preprocessor=audio_preprocessor,
+            )
             start_sample = int(resolved_start * processed_sample_rate)
             end_sample = (
                 int(resolved_end * processed_sample_rate)
@@ -457,8 +482,9 @@ class MultiDatasetPipelineBuilder:
         )
         return audio, int(sample_rate)
 
-    def _preprocessor_sample_rate(self) -> int | None:
-        sample_rate = getattr(self.audio_preprocessor, "sr", None)
+    @staticmethod
+    def _preprocessor_sample_rate(audio_preprocessor: AudioProcessor) -> int | None:
+        sample_rate = getattr(audio_preprocessor, "sr", None)
         return int(sample_rate) if sample_rate is not None else None
 
     def _cache_exists(self, cache_key: str) -> bool:
@@ -516,7 +542,12 @@ class MultiDatasetPipelineBuilder:
             raise RuntimeError("Build the train/test pipeline before resolving row indices.")
         return pd.concat([self._train_df, self._test_df], ignore_index=True)
 
-    def _extract_features(self, dataframe: pd.DataFrame, n_jobs: int) -> pd.DataFrame:
+    def _extract_features(
+        self,
+        dataframe: pd.DataFrame,
+        n_jobs: int,
+        audio_preprocessor: AudioProcessor | None,
+    ) -> pd.DataFrame:
         grouped_cycles: list[tuple[str, list[tuple[Hashable, float, float]]]] = []
         for wav_path, group in dataframe.groupby("wav_path", sort=False):
             indices = group.index.to_numpy()
@@ -532,7 +563,7 @@ class MultiDatasetPipelineBuilder:
                     wav_path,
                     cycles,
                     self.FEATURE_SAMPLE_RATE,
-                    self.audio_preprocessor,
+                    audio_preprocessor,
                 )
                 for wav_path, cycles in grouped_cycles
             ),
@@ -557,12 +588,19 @@ class MultiDatasetPipelineBuilder:
             }
         )
 
-    def _feature_cache_key(self, split: float, random_state: int, n_jobs: int) -> str:
+    def _feature_cache_key(
+        self,
+        split: float,
+        random_state: int,
+        n_jobs: int,
+        audio_preprocessor: AudioProcessor | None,
+    ) -> str:
         return self._hash_state(
             {
                 "base": self._cache_key(split, random_state),
                 "sample_rate": self.FEATURE_SAMPLE_RATE,
                 "n_jobs": n_jobs,
+                "audio_preprocessor": self._object_state(audio_preprocessor),
                 "implementation": self._FEATURE_EXTRACTION_VERSION,
             }
         )
@@ -577,7 +615,6 @@ class MultiDatasetPipelineBuilder:
                 for source in self._sources
             ],
             "transformers": [self._object_state(transformer) for transformer in self._transformers],
-            "audio_preprocessor": self._object_state(self.audio_preprocessor),
         }
 
     @classmethod

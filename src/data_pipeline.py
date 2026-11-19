@@ -1,8 +1,15 @@
 from __future__ import annotations
 
 import hashlib
+import inspect
 import json
-from collections.abc import Callable, Hashable
+import os
+import tempfile
+import time
+import types
+import warnings
+from collections.abc import Callable, Hashable, Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
@@ -30,7 +37,7 @@ class DataFrameTransformer(Protocol):
 
 SchemaTransformer = DataFrameTransformer | Callable[[pd.DataFrame], pd.DataFrame]
 AudioProcessor = Callable[[np.ndarray], np.ndarray]
-Record = int | np.integer | pd.Series | dict[str, object]
+type Record = int | np.integer | pd.Series | dict[str, object]
 
 
 @lru_cache(maxsize=16)
@@ -192,8 +199,8 @@ class MultiDatasetPipelineBuilder:
     _MANIFEST_NAME = "manifest.json"
     _ALL_DATASET_NAME = "all.parquet"
     _FEATURE_DATASET_NAME = "all_features.parquet"
-    _TRAIN_FEATURES_NAME = "train_features.parquet"
-    _TEST_FEATURES_NAME = "test_features.parquet"
+    _CACHE_LOCK_NAME = ".cache.lock"
+    _CACHE_LOCK_TIMEOUT = 30.0
     _DROP_COLUMNS = (
         "patient_id",
         "recording_id",
@@ -238,11 +245,7 @@ class MultiDatasetPipelineBuilder:
         random_state: int = 42,
         force_recompute: bool = False,
     ) -> tuple[pd.DataFrame, pd.DataFrame]:
-        """Build or load the cached train/test dataframes."""
-        cache_key = self._cache_key(split, random_state)
-        if not force_recompute and self._cache_exists(cache_key):
-            return self._load_cached_train_test()
-
+        """Build train/test dataframes in memory."""
         if not self._sources:
             raise ValueError("At least one dataset source must be registered.")
 
@@ -266,7 +269,6 @@ class MultiDatasetPipelineBuilder:
 
         self._train_df = train_df
         self._test_df = test_df
-        self._save_cached_train_test(train_df, test_df, cache_key)
         return train_df, test_df
 
     def build_dataset(
@@ -279,7 +281,14 @@ class MultiDatasetPipelineBuilder:
         if self.cache_path is not None and not force_recompute:
             cache_key = self._cache_key(split, random_state)
             if self._cached_artifact_matches(self._ALL_DATASET_NAME, cache_key):
-                return pq.read_table(self._artifact_path(self._ALL_DATASET_NAME)).to_pandas()
+                dataframe = pq.read_table(self._artifact_path(self._ALL_DATASET_NAME)).to_pandas()
+                self._restore_cached_split(
+                    dataframe,
+                    self._ALL_DATASET_NAME,
+                    split=split,
+                    random_state=random_state,
+                )
+                return dataframe
 
         train_df, test_df = self.build_train_test(
             split=split,
@@ -288,7 +297,10 @@ class MultiDatasetPipelineBuilder:
         )
         dataframe = pd.concat([train_df, test_df], ignore_index=True)
         self._save_cached_dataframe(
-            dataframe, self._ALL_DATASET_NAME, self._cache_key(split, random_state)
+            dataframe,
+            self._ALL_DATASET_NAME,
+            self._cache_key(split, random_state),
+            metadata={"train_rows": str(len(train_df))},
         )
         return dataframe
 
@@ -310,18 +322,20 @@ class MultiDatasetPipelineBuilder:
         audio_preprocessor: AudioProcessor | None = None,
     ) -> pd.DataFrame:
         """Build the complete dataset and append cached audio features."""
-        cache_key = self._feature_cache_key(
-            split,
-            random_state,
-            n_jobs,
-            audio_preprocessor,
-        )
+        cache_key = self._feature_cache_key(split, random_state, audio_preprocessor)
         if (
             self.cache_path is not None
             and not force_recompute
             and self._cached_artifact_matches(self._FEATURE_DATASET_NAME, cache_key)
         ):
-            return pq.read_table(self._artifact_path(self._FEATURE_DATASET_NAME)).to_pandas()
+            result = pq.read_table(self._artifact_path(self._FEATURE_DATASET_NAME)).to_pandas()
+            self._restore_cached_split(
+                result,
+                self._FEATURE_DATASET_NAME,
+                split=split,
+                random_state=random_state,
+            )
+            return result
 
         train_df, test_df = self.build_train_test_with_features(
             split=split,
@@ -331,7 +345,12 @@ class MultiDatasetPipelineBuilder:
             audio_preprocessor=audio_preprocessor,
         )
         result = pd.concat([train_df, test_df], ignore_index=True)
-        self._save_cached_dataframe(result, self._FEATURE_DATASET_NAME, cache_key)
+        self._save_cached_dataframe(
+            result,
+            self._FEATURE_DATASET_NAME,
+            cache_key,
+            metadata={"train_rows": str(len(train_df))},
+        )
         return result
 
     def build_all_with_features(
@@ -360,19 +379,6 @@ class MultiDatasetPipelineBuilder:
         audio_preprocessor: AudioProcessor | None = None,
     ) -> tuple[pd.DataFrame, pd.DataFrame]:
         """Build train/test dataframes and extract features without data leakage."""
-        feature_cache_key = self._feature_cache_key(
-            split,
-            random_state,
-            n_jobs,
-            audio_preprocessor,
-        )
-        if (
-            not force_recompute
-            and self._cached_artifact_matches(self._TRAIN_FEATURES_NAME, feature_cache_key)
-            and self._cached_artifact_matches(self._TEST_FEATURES_NAME, feature_cache_key)
-        ):
-            return self._load_cached_train_test_features()
-
         train_df, test_df = self.build_train_test(
             split=split,
             random_state=random_state,
@@ -389,16 +395,6 @@ class MultiDatasetPipelineBuilder:
 
         self._train_df = train_features
         self._test_df = test_features
-        self._save_cached_dataframe(
-            train_features,
-            self._TRAIN_FEATURES_NAME,
-            feature_cache_key,
-        )
-        self._save_cached_dataframe(
-            test_features,
-            self._TEST_FEATURES_NAME,
-            feature_cache_key,
-        )
         return train_features, test_features
 
     def resolve(
@@ -487,56 +483,6 @@ class MultiDatasetPipelineBuilder:
         sample_rate = getattr(audio_preprocessor, "sr", None)
         return int(sample_rate) if sample_rate is not None else None
 
-    def _cache_exists(self, cache_key: str) -> bool:
-        if self.cache_path is None:
-            return False
-        return self._cached_artifact_matches(
-            "train.parquet", cache_key
-        ) and self._cached_artifact_matches("test.parquet", cache_key)
-
-    def _load_cached_train_test(self) -> tuple[pd.DataFrame, pd.DataFrame]:
-        if self.cache_path is None:
-            raise RuntimeError("Cache path is not configured.")
-
-        train_df = pq.read_table(self._artifact_path("train.parquet")).to_pandas()
-        test_df = pq.read_table(self._artifact_path("test.parquet")).to_pandas()
-        self._train_df = train_df
-        self._test_df = test_df
-        return train_df, test_df
-
-    def _load_cached_train_test_features(
-        self,
-    ) -> tuple[pd.DataFrame, pd.DataFrame]:
-        if self.cache_path is None:
-            raise RuntimeError("Cache path is not configured.")
-
-        train_df = pq.read_table(self._artifact_path(self._TRAIN_FEATURES_NAME)).to_pandas()
-        test_df = pq.read_table(self._artifact_path(self._TEST_FEATURES_NAME)).to_pandas()
-        self._train_df = train_df
-        self._test_df = test_df
-        return train_df, test_df
-
-    def _save_cached_train_test(
-        self,
-        train_df: pd.DataFrame,
-        test_df: pd.DataFrame,
-        cache_key: str,
-    ) -> None:
-        if self.cache_path is None:
-            return
-
-        self.cache_path.mkdir(parents=True, exist_ok=True)
-        pq.write_table(
-            pa.Table.from_pandas(train_df, preserve_index=False),
-            self._artifact_path("train.parquet"),
-        )
-        pq.write_table(
-            pa.Table.from_pandas(test_df, preserve_index=False),
-            self._artifact_path("test.parquet"),
-        )
-        self._write_manifest("train.parquet", cache_key)
-        self._write_manifest("test.parquet", cache_key)
-
     def _combined_dataframe(self) -> pd.DataFrame:
         if self._train_df is None or self._test_df is None:
             raise RuntimeError("Build the train/test pipeline before resolving row indices.")
@@ -592,14 +538,12 @@ class MultiDatasetPipelineBuilder:
         self,
         split: float,
         random_state: int,
-        n_jobs: int,
         audio_preprocessor: AudioProcessor | None,
     ) -> str:
         return self._hash_state(
             {
                 "base": self._cache_key(split, random_state),
                 "sample_rate": self.FEATURE_SAMPLE_RATE,
-                "n_jobs": n_jobs,
                 "audio_preprocessor": self._object_state(audio_preprocessor),
                 "implementation": self._FEATURE_EXTRACTION_VERSION,
             }
@@ -621,14 +565,44 @@ class MultiDatasetPipelineBuilder:
     def _object_state(cls, value: object) -> object:
         if value is None or isinstance(value, (bool, int, float, str)):
             return value
+        if isinstance(value, np.generic):
+            return value.item()
+        if isinstance(value, np.ndarray):
+            contiguous = np.ascontiguousarray(value)
+            return {
+                "dtype": str(contiguous.dtype),
+                "shape": list(contiguous.shape),
+                "sha256": hashlib.sha256(contiguous.tobytes()).hexdigest(),
+            }
         if isinstance(value, Path):
-            return str(value)
+            return cls._path_state(value)
         if isinstance(value, (list, tuple)):
             return [cls._object_state(item) for item in value]
         if isinstance(value, dict):
             return {
                 str(key): cls._object_state(item)
                 for key, item in sorted(value.items(), key=lambda item: str(item[0]))
+            }
+        if isinstance(value, (types.FunctionType, types.BuiltinFunctionType)):
+            try:
+                source = inspect.getsource(value)
+            except (OSError, TypeError):
+                source = None
+            closure = getattr(value, "__closure__", None)
+            return {
+                "type": f"{type(value).__module__}.{type(value).__qualname__}",
+                "module": getattr(value, "__module__", None),
+                "qualname": getattr(value, "__qualname__", None),
+                "source_sha256": (
+                    hashlib.sha256(source.encode("utf-8")).hexdigest()
+                    if source is not None
+                    else None
+                ),
+                "closure": (
+                    [cls._object_state(cell.cell_contents) for cell in closure]
+                    if closure is not None
+                    else None
+                ),
             }
         attributes = getattr(value, "__dict__", None)
         if isinstance(attributes, dict):
@@ -644,6 +618,32 @@ class MultiDatasetPipelineBuilder:
             "state": cls._object_state(state) if state is not None else None,
         }
 
+    @classmethod
+    def _path_state(cls, path: Path) -> dict[str, object]:
+        state: dict[str, object] = {"path": str(path), "exists": path.exists()}
+        if not path.exists():
+            return state
+
+        if path.is_file():
+            stat = path.stat()
+            state["file"] = {"size": stat.st_size, "mtime_ns": stat.st_mtime_ns}
+            return state
+
+        entries = []
+        for entry in sorted(path.rglob("*")):
+            if not entry.is_file():
+                continue
+            stat = entry.stat()
+            entries.append(
+                {
+                    "path": str(entry.relative_to(path)),
+                    "size": stat.st_size,
+                    "mtime_ns": stat.st_mtime_ns,
+                }
+            )
+        state["files"] = entries
+        return state
+
     @staticmethod
     def _hash_state(state: object) -> str:
         serialized = json.dumps(state, sort_keys=True, default=str).encode("utf-8")
@@ -651,6 +651,11 @@ class MultiDatasetPipelineBuilder:
 
     def _manifest_path(self) -> Path | None:
         return self._artifact_path(self._MANIFEST_NAME) if self.cache_path is not None else None
+
+    def _lock_path(self) -> Path | None:
+        if self.cache_path is None:
+            return None
+        return self.cache_path / f"{self._CACHE_LOCK_NAME}{self.cache_suffix}"
 
     def _artifact_path(self, artifact: str) -> Path:
         if self.cache_path is None:
@@ -660,37 +665,171 @@ class MultiDatasetPipelineBuilder:
         return self.cache_path / filename
 
     def _cached_artifact_matches(self, artifact: str, cache_key: str) -> bool:
-        manifest_path = self._manifest_path()
-        if manifest_path is None or not manifest_path.is_file():
+        manifest = self._read_manifest()
+        if manifest is None:
             return False
-        cache_path = self.cache_path
-        if cache_path is None:
-            return False
-        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
         return manifest.get(artifact) == cache_key and self._artifact_path(artifact).is_file()
 
+    def _read_manifest(self) -> dict[str, object] | None:
+        manifest_path = self._manifest_path()
+        if manifest_path is None or not manifest_path.is_file():
+            return None
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError, TypeError) as error:
+            warnings.warn(
+                f"Ignoring invalid cache manifest {manifest_path}: {error}",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            return None
+        if not isinstance(manifest, dict):
+            warnings.warn(
+                f"Ignoring invalid cache manifest {manifest_path}: expected an object",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            return None
+        return manifest
+
+    def _restore_cached_split(
+        self,
+        dataframe: pd.DataFrame,
+        artifact: str,
+        *,
+        split: float,
+        random_state: int,
+    ) -> None:
+        manifest = self._read_manifest()
+        train_rows = manifest.get(f"{artifact}:train_rows") if manifest is not None else None
+        if isinstance(train_rows, (str, int)):
+            try:
+                train_length = int(train_rows)
+            except ValueError:
+                train_length = None
+        else:
+            train_length = None
+
+        if train_length is None or not 0 <= train_length <= len(dataframe):
+            train_df, test_df = self.build_train_test(
+                split=split,
+                random_state=random_state,
+            )
+            train_length = len(train_df)
+            if train_length + len(test_df) != len(dataframe):
+                raise ValueError(
+                    f"Cached artifact {artifact} has an unexpected number of rows."
+                )
+
+        self._train_df = dataframe.iloc[:train_length].reset_index(drop=True)
+        self._test_df = dataframe.iloc[train_length:].reset_index(drop=True)
+
     def _write_manifest(self, artifact: str, cache_key: str) -> None:
+        manifest_path = self._manifest_path()
+        if manifest_path is None:
+            return
+        with self._cache_lock():
+            self._write_manifest_unlocked(artifact, cache_key)
+
+    def _write_manifest_unlocked(
+        self,
+        artifact: str,
+        cache_key: str,
+        metadata: dict[str, str] | None = None,
+    ) -> None:
         manifest_path = self._manifest_path()
         if manifest_path is None:
             return
         manifest_path.parent.mkdir(parents=True, exist_ok=True)
         manifest: dict[str, str] = {}
         if manifest_path.is_file():
-            manifest = cast(dict[str, str], json.loads(manifest_path.read_text(encoding="utf-8")))
+            try:
+                loaded_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError, TypeError):
+                loaded_manifest = {}
+            if isinstance(loaded_manifest, dict):
+                manifest = {
+                    str(key): str(value)
+                    for key, value in loaded_manifest.items()
+                    if isinstance(value, str)
+                }
         manifest[artifact] = cache_key
-        manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True), encoding="utf-8")
+        if metadata is not None:
+            manifest.update({f"{artifact}:{key}": value for key, value in metadata.items()})
+        self._atomic_write_text(
+            manifest_path,
+            json.dumps(manifest, indent=2, sort_keys=True),
+        )
 
     def _save_cached_dataframe(
-        self, dataframe: pd.DataFrame, artifact: str, cache_key: str
+        self,
+        dataframe: pd.DataFrame,
+        artifact: str,
+        cache_key: str,
+        metadata: dict[str, str] | None = None,
     ) -> None:
         if self.cache_path is None:
             return
         self.cache_path.mkdir(parents=True, exist_ok=True)
-        pq.write_table(
-            pa.Table.from_pandas(dataframe, preserve_index=False),
-            self._artifact_path(artifact),
+        artifact_path = self._artifact_path(artifact)
+        with self._cache_lock():
+            temporary_path = self._temporary_path(artifact_path)
+            try:
+                pq.write_table(
+                    pa.Table.from_pandas(dataframe, preserve_index=False),
+                    temporary_path,
+                )
+                os.replace(temporary_path, artifact_path)
+                self._write_manifest_unlocked(artifact, cache_key, metadata)
+            finally:
+                temporary_path.unlink(missing_ok=True)
+
+    @contextmanager
+    def _cache_lock(self) -> Iterator[None]:
+        lock_path = self._lock_path()
+        if lock_path is None:
+            yield
+            return
+
+        if self.cache_path is None:
+            raise RuntimeError("Cache path is not configured.")
+        self.cache_path.mkdir(parents=True, exist_ok=True)
+        deadline = time.monotonic() + self._CACHE_LOCK_TIMEOUT
+        while True:
+            try:
+                descriptor = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+                os.close(descriptor)
+                break
+            except FileExistsError:
+                if time.monotonic() >= deadline:
+                    raise TimeoutError(
+                        f"Timed out waiting for cache lock {lock_path}."
+                    ) from None
+                time.sleep(0.05)
+
+        try:
+            yield
+        finally:
+            lock_path.unlink(missing_ok=True)
+
+    @staticmethod
+    def _temporary_path(target_path: Path) -> Path:
+        descriptor, temporary_name = tempfile.mkstemp(
+            dir=target_path.parent,
+            prefix=f".{target_path.name}.",
+            suffix=".tmp",
         )
-        self._write_manifest(artifact, cache_key)
+        os.close(descriptor)
+        return Path(temporary_name)
+
+    @staticmethod
+    def _atomic_write_text(path: Path, content: str) -> None:
+        temporary_path = MultiDatasetPipelineBuilder._temporary_path(path)
+        try:
+            temporary_path.write_text(content, encoding="utf-8")
+            os.replace(temporary_path, path)
+        finally:
+            temporary_path.unlink(missing_ok=True)
 
     @staticmethod
     def _apply_schema_transformer(

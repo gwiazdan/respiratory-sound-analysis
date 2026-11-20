@@ -8,7 +8,7 @@ import tempfile
 import time
 import types
 import warnings
-from collections.abc import Callable, Hashable, Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from functools import lru_cache
@@ -97,30 +97,23 @@ def _apply_audio_preprocessor(
     return processed
 
 
-def _extract_file_features(
+def _extract_recording_features(
     wav_path: str,
-    cycles: list[tuple[object, float, float]],
+    index: object,
     feature_sample_rate: int,
     audio_preprocessor: AudioProcessor | None,
-) -> list[dict[str, object]]:
+) -> dict[str, object]:
     full_audio, sample_rate = _load_feature_audio(
         wav_path,
         feature_sample_rate,
         audio_preprocessor,
     )
-    features: list[dict[str, object]] = []
-    for index, start, end in cycles:
-        start_sample = int(start * sample_rate)
-        end_sample = int(end * sample_rate)
-        audio = full_audio[start_sample:end_sample]
-        if len(audio) < 128:
-            features.append({"index": index})
-            continue
-        features.append(_extract_cycle_features(audio, sample_rate, index))
-    return features
+    if len(full_audio) < 128:
+        return {"index": index}
+    return _extract_audio_features(full_audio, sample_rate, index)
 
 
-def _extract_cycle_features(
+def _extract_audio_features(
     audio: np.ndarray,
     sample_rate: int,
     index: object,
@@ -132,6 +125,8 @@ def _extract_cycle_features(
         return {
             f"{prefix}_mean": float(np.mean(values)),
             f"{prefix}_std": float(np.std(values)),
+            f"{prefix}_min": float(np.min(values)),
+            f"{prefix}_max": float(np.max(values)),
         }
 
     rms = librosa.feature.rms(y=audio, frame_length=n_fft, hop_length=hop_length)
@@ -195,7 +190,7 @@ class MultiDatasetPipelineBuilder:
     """Build train/test dataframes from multiple dataset sources."""
 
     FEATURE_SAMPLE_RATE = 4000
-    _FEATURE_EXTRACTION_VERSION = 2
+    _FEATURE_EXTRACTION_VERSION = 3
     _MANIFEST_NAME = "manifest.json"
     _ALL_DATASET_NAME = "all.parquet"
     _FEATURE_DATASET_NAME = "all_features.parquet"
@@ -488,38 +483,67 @@ class MultiDatasetPipelineBuilder:
             raise RuntimeError("Build the train/test pipeline before resolving row indices.")
         return pd.concat([self._train_df, self._test_df], ignore_index=True)
 
+    @staticmethod
+    def _group_recordings(dataframe: pd.DataFrame) -> pd.DataFrame:
+        """Return one data row per recording, preserving recording metadata."""
+        if dataframe.empty or "wav_path" not in dataframe.columns:
+            return dataframe.copy()
+
+        anomaly_columns = [
+            column
+            for column in ("crackles", "wheezes", "rhonchi", "stridor")
+            if column in dataframe.columns
+        ]
+        constant_columns = [
+            column
+            for column in dataframe.columns
+            if column not in {"wav_path", "start", "end", *anomaly_columns}
+        ]
+        aggregation = {
+            **dict.fromkeys(constant_columns, "first"),
+            **dict.fromkeys(anomaly_columns, "max"),
+        }
+        recordings = dataframe.groupby("wav_path", sort=False, as_index=False).agg(aggregation)
+        if "start" in dataframe.columns:
+            starts = dataframe.groupby("wav_path", sort=False)["start"].first()
+            recordings["start"] = recordings["wav_path"].map(starts)
+        if "end" in dataframe.columns:
+            ends = dataframe.groupby("wav_path", sort=False)["end"].max()
+            recordings["end"] = recordings["wav_path"].map(ends)
+        for column in anomaly_columns:
+            recordings[column] = recordings[column].fillna(False).astype(bool)
+        return cast(pd.DataFrame, recordings.reset_index(drop=True))
+
     def _extract_features(
         self,
         dataframe: pd.DataFrame,
         n_jobs: int,
         audio_preprocessor: AudioProcessor | None,
     ) -> pd.DataFrame:
-        grouped_cycles: list[tuple[str, list[tuple[Hashable, float, float]]]] = []
-        for wav_path, group in dataframe.groupby("wav_path", sort=False):
-            indices = group.index.to_numpy()
-            starts = group["start"].to_numpy(dtype=float, copy=False)
-            ends = group["end"].to_numpy(dtype=float, copy=False)
-            cycles = list(zip(indices, starts, ends, strict=True))
-            grouped_cycles.append((cast(str, wav_path), cycles))
+        recordings = self._group_recordings(dataframe)
+        grouped_recordings = [
+            (cast(str, wav_path), int(index))
+            for (wav_path, group) in recordings.groupby("wav_path", sort=False)
+            for index in [group.index[0]]
+        ]
 
         grouped_features = cast(
-            list[list[dict[str, object]]],
+            list[dict[str, object]],
             Parallel(n_jobs=n_jobs)(
-                delayed(_extract_file_features)(
+                delayed(_extract_recording_features)(
                     wav_path,
-                    cycles,
+                    index,
                     self.FEATURE_SAMPLE_RATE,
                     audio_preprocessor,
                 )
-                for wav_path, cycles in grouped_cycles
+                for wav_path, index in grouped_recordings
             ),
         )
-        feature_rows = [row for rows in grouped_features for row in rows]
-        if not feature_rows:
+        if not grouped_features:
             return dataframe.copy()
 
-        feature_dataframe = pd.DataFrame(feature_rows).set_index("index")
-        result = dataframe.copy()
+        feature_dataframe = pd.DataFrame(grouped_features).set_index("index")
+        result = recordings.copy()
         feature_columns = [column for column in feature_dataframe if column in result]
         if feature_columns:
             result = result.drop(columns=feature_columns)
@@ -717,9 +741,7 @@ class MultiDatasetPipelineBuilder:
             )
             train_length = len(train_df)
             if train_length + len(test_df) != len(dataframe):
-                raise ValueError(
-                    f"Cached artifact {artifact} has an unexpected number of rows."
-                )
+                raise ValueError(f"Cached artifact {artifact} has an unexpected number of rows.")
 
         self._train_df = dataframe.iloc[:train_length].reset_index(drop=True)
         self._test_df = dataframe.iloc[train_length:].reset_index(drop=True)
@@ -802,9 +824,7 @@ class MultiDatasetPipelineBuilder:
                 break
             except FileExistsError:
                 if time.monotonic() >= deadline:
-                    raise TimeoutError(
-                        f"Timed out waiting for cache lock {lock_path}."
-                    ) from None
+                    raise TimeoutError(f"Timed out waiting for cache lock {lock_path}.") from None
                 time.sleep(0.05)
 
         try:
@@ -860,7 +880,8 @@ class MultiDatasetPipelineBuilder:
         if "rhonchi" in merged.columns:
             merged["rhonchi"] = merged["rhonchi"].fillna(False).astype(int)
         columns_to_drop = [column for column in cls._DROP_COLUMNS if column in merged.columns]
-        return merged.drop(columns=columns_to_drop)
+        merged = merged.drop(columns=columns_to_drop)
+        return cls._group_recordings(merged)
 
 
 def transform_spr(df: pd.DataFrame) -> pd.DataFrame:

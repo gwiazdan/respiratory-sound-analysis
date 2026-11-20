@@ -8,6 +8,50 @@ import pandas as pd
 from sklearn.model_selection import GroupShuffleSplit
 
 
+def _aggregate_recordings(dataframe: pd.DataFrame) -> pd.DataFrame:
+    """Collapse cycle/event rows into one row per recording."""
+    if dataframe.empty:
+        return dataframe.copy()
+
+    recording_key = "wav_path" if "wav_path" in dataframe.columns else "filename"
+    if recording_key not in dataframe.columns:
+        return dataframe.copy()
+
+    anomaly_columns = [
+        column
+        for column in ("crackles", "wheezes", "rhonchi", "stridor")
+        if column in dataframe.columns
+    ]
+
+    first_columns = [
+        column
+        for column in dataframe.columns
+        if column not in {recording_key, "start", "end", *anomaly_columns}
+    ]
+    aggregated = (
+        dataframe.groupby(recording_key, sort=False, as_index=False)
+        .agg(
+            {
+                **dict.fromkeys(first_columns, "first"),
+                **dict.fromkeys(anomaly_columns, "max"),
+            }
+        )
+        .reset_index(drop=True)
+    )
+
+    if "start" in dataframe.columns:
+        starts = dataframe.groupby(recording_key, sort=False)["start"].first()
+        aggregated["start"] = aggregated[recording_key].map(starts)
+    if "end" in dataframe.columns:
+        ends = dataframe.groupby(recording_key, sort=False)["end"].max()
+        aggregated["end"] = aggregated[recording_key].map(ends)
+
+    for column in anomaly_columns:
+        aggregated[column] = aggregated[column].fillna(False).astype(bool)
+
+    return cast(pd.DataFrame, aggregated)
+
+
 class Dataset:
     def __init__(self, dataset_path: str | Path) -> None:
         self.dataset_path = Path(dataset_path)
@@ -82,10 +126,16 @@ class SPRSoundDataset(Dataset):
     def _unify(self) -> pd.DataFrame:
         dataframe = self._get_dataframe()
         # Keep both wheeze and crackle labels available for the common schema.
+        for column in ("fine crackle", "coarse crackle", "wheeze+crackle", "wheeze", "stridor"):
+            if column not in dataframe:
+                dataframe[column] = False
         dataframe["crackles"] = dataframe[["fine crackle", "coarse crackle", "wheeze+crackle"]].any(
             axis=1
         )
         dataframe["wheezes"] = dataframe[["wheeze", "stridor", "wheeze+crackle"]].any(axis=1)
+        if "rhonchi" not in dataframe:
+            dataframe["rhonchi"] = False
+        dataframe = _aggregate_recordings(dataframe)
 
         columns = [
             "start",
@@ -165,7 +215,7 @@ class ICBHIDataset(Dataset):
             self.df = df
 
     def _unify(self) -> pd.DataFrame:
-        return self._get_dataframe()
+        return _aggregate_recordings(self._get_dataframe())
 
     def get_train_test(
         self, split: float = 0.7, random_state: int = 42
@@ -269,7 +319,6 @@ class HFLungSoundDataset(Dataset):
                 if len(parts) not in (4, 6):
                     continue
                 try:
-                    phases: list[dict[str, Any]] = []
                     annotations_raw: list[dict[str, Any]] = []
 
                     with open(file, encoding="utf-8") as f:
@@ -290,37 +339,8 @@ class HFLungSoundDataset(Dataset):
                                 end_sec = pd.to_timedelta(end_str).total_seconds()
 
                             item = {"type": t_type, "start": start_sec, "end": end_sec}
-                            if t_type in ("I", "E"):
-                                phases.append(item)
-                            else:
+                            if t_type not in ("I", "E"):
                                 annotations_raw.append(item)
-
-                    if not phases:
-                        continue
-
-                    phases.sort(key=lambda x: x["start"])
-
-                    cycles = []
-                    current_start, current_end = None, None
-
-                    for phase in phases:
-                        if phase["type"] == "I":
-                            if current_start is not None:
-                                cycles.append({"start": current_start, "end": current_end})
-                            current_start = phase["start"]
-                            current_end = phase["end"]
-                        elif phase["type"] == "E":
-                            if current_start is None:
-                                current_start = phase["start"]
-                            current_end = (
-                                max(current_end, phase["end"]) if current_end else phase["end"]
-                            )
-
-                    if current_start is not None:
-                        cycles.append({"start": current_start, "end": current_end})
-
-                    if not cycles:
-                        continue
 
                     file_name_val = (
                         filename_stem.rsplit("_", 1)[0] if len(parts) in (4, 6) else filename_stem
@@ -332,29 +352,25 @@ class HFLungSoundDataset(Dataset):
                         "rhonchi": "rhonchi",
                         "stridor": "stridor",
                     }
+                    recording = {
+                        "start": 0.0,
+                        "end": max(
+                            (item["end"] for item in annotations_raw),
+                            default=0.0,
+                        ),
+                        "filename": file_name_val,
+                        "crackles": 0,
+                        "wheezes": 0,
+                        "rhonchi": 0,
+                        "stridor": 0,
+                    }
 
-                    file_cycles = []
-                    for cycle in cycles:
-                        c_dict = {
-                            "start": cycle["start"],
-                            "end": cycle["end"],
-                            "filename": file_name_val,
-                            "crackles": 0,
-                            "wheezes": 0,
-                            "rhonchi": 0,
-                            "stridor": 0,
-                        }
+                    for anomaly in annotations_raw:
+                        target_col = type_map.get(str(anomaly["type"]).lower())
+                        if target_col:
+                            recording[target_col] = 1
 
-                        for anomaly in annotations_raw:
-                            target_col = type_map.get(str(anomaly["type"]).lower())
-                            if target_col and (
-                                cycle["start"] < anomaly["end"] and cycle["end"] > anomaly["start"]
-                            ):
-                                c_dict[target_col] = 1
-
-                        file_cycles.append(c_dict)
-
-                    annotations.extend(file_cycles)
+                    annotations.append(recording)
 
                 except Exception as e:
                     print(f"Pominięto uszkodzony plik adnotacji {file.name}: {e}")
@@ -371,6 +387,7 @@ class HFLungSoundDataset(Dataset):
 
     def _unify(self) -> pd.DataFrame:
         dataframe = self._get_dataframe()
+        dataframe = _aggregate_recordings(dataframe)
         dataframe["crackles"] = dataframe[["crackles"]].any(axis=1)
         dataframe["wheezes"] = dataframe[["wheezes", "stridor"]].any(axis=1)
         columns = [

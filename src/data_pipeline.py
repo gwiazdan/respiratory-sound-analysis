@@ -85,6 +85,16 @@ def _load_feature_audio(
     return _apply_audio_preprocessor(audio, audio_preprocessor), target_sample_rate
 
 
+def processed_audio_path(wav_path: str | Path, directory: str | Path) -> Path:
+    """File holding the processed (e.g. denoised) copy of ``wav_path`` in ``directory``.
+
+    Such folders are written by ``src.denoising.inference.save_processed_audio``: one 4 kHz
+    float16 ``.npy`` per recording, named by the file stem and a hash of its full path.
+    """
+    digest = hashlib.sha1(str(Path(wav_path).resolve()).encode("utf-8"), usedforsecurity=False)
+    return Path(directory) / f"{Path(wav_path).stem}_{digest.hexdigest()[:10]}.npy"
+
+
 def _apply_audio_preprocessor(
     audio: np.ndarray,
     audio_preprocessor: AudioProcessor | None,
@@ -102,12 +112,23 @@ def _extract_recording_features(
     index: object,
     feature_sample_rate: int,
     audio_preprocessor: AudioProcessor | None,
+    audio_dir: Path | None = None,
 ) -> dict[str, object]:
-    full_audio, sample_rate = _load_feature_audio(
-        wav_path,
-        feature_sample_rate,
-        audio_preprocessor,
-    )
+    if audio_dir is None:
+        full_audio, sample_rate = _load_feature_audio(
+            wav_path,
+            feature_sample_rate,
+            audio_preprocessor,
+        )
+    else:
+        processed = processed_audio_path(wav_path, audio_dir)
+        if not processed.is_file():
+            raise FileNotFoundError(
+                f"{processed} is missing; create it with save_processed_audio first."
+            )
+        audio = np.load(processed).astype(np.float32)
+        full_audio = _apply_audio_preprocessor(audio, audio_preprocessor)
+        sample_rate = feature_sample_rate
     if len(full_audio) < 128:
         return {"index": index}
     return _extract_audio_features(full_audio, sample_rate, index)
@@ -315,9 +336,14 @@ class MultiDatasetPipelineBuilder:
         force_recompute: bool = False,
         n_jobs: int = -1,
         audio_preprocessor: AudioProcessor | None = None,
+        audio_dir: str | Path | None = None,
     ) -> pd.DataFrame:
-        """Build the complete dataset and append cached audio features."""
-        cache_key = self._feature_cache_key(split, random_state, audio_preprocessor)
+        """Build the complete dataset and append cached audio features.
+
+        ``audio_dir`` reads already processed recordings (e.g. denoised ones, see
+        :func:`processed_audio_path`) instead of the original ``.wav`` files.
+        """
+        cache_key = self._feature_cache_key(split, random_state, audio_preprocessor, audio_dir)
         if (
             self.cache_path is not None
             and not force_recompute
@@ -338,6 +364,7 @@ class MultiDatasetPipelineBuilder:
             force_recompute=force_recompute,
             n_jobs=n_jobs,
             audio_preprocessor=audio_preprocessor,
+            audio_dir=audio_dir,
         )
         result = pd.concat([train_df, test_df], ignore_index=True)
         self._save_cached_dataframe(
@@ -355,6 +382,7 @@ class MultiDatasetPipelineBuilder:
         force_recompute: bool = False,
         n_jobs: int = -1,
         audio_preprocessor: AudioProcessor | None = None,
+        audio_dir: str | Path | None = None,
     ) -> pd.DataFrame:
         """Alias for :meth:`build_dataset_with_features`."""
         return self.build_dataset_with_features(
@@ -363,6 +391,7 @@ class MultiDatasetPipelineBuilder:
             force_recompute,
             n_jobs,
             audio_preprocessor,
+            audio_dir,
         )
 
     def build_train_test_with_features(
@@ -372,6 +401,7 @@ class MultiDatasetPipelineBuilder:
         force_recompute: bool = False,
         n_jobs: int = -1,
         audio_preprocessor: AudioProcessor | None = None,
+        audio_dir: str | Path | None = None,
     ) -> tuple[pd.DataFrame, pd.DataFrame]:
         """Build train/test dataframes and extract features without data leakage."""
         train_df, test_df = self.build_train_test(
@@ -384,6 +414,7 @@ class MultiDatasetPipelineBuilder:
             pd.concat([train_df, test_df], ignore_index=True),
             n_jobs=n_jobs,
             audio_preprocessor=audio_preprocessor,
+            audio_dir=Path(audio_dir) if audio_dir is not None else None,
         )
         train_features = combined_features.iloc[:train_length].reset_index(drop=True)
         test_features = combined_features.iloc[train_length:].reset_index(drop=True)
@@ -519,6 +550,7 @@ class MultiDatasetPipelineBuilder:
         dataframe: pd.DataFrame,
         n_jobs: int,
         audio_preprocessor: AudioProcessor | None,
+        audio_dir: Path | None = None,
     ) -> pd.DataFrame:
         recordings = self._group_recordings(dataframe)
         grouped_recordings = [
@@ -535,6 +567,7 @@ class MultiDatasetPipelineBuilder:
                     index,
                     self.FEATURE_SAMPLE_RATE,
                     audio_preprocessor,
+                    audio_dir,
                 )
                 for wav_path, index in grouped_recordings
             ),
@@ -563,15 +596,17 @@ class MultiDatasetPipelineBuilder:
         split: float,
         random_state: int,
         audio_preprocessor: AudioProcessor | None,
+        audio_dir: str | Path | None = None,
     ) -> str:
-        return self._hash_state(
-            {
-                "base": self._cache_key(split, random_state),
-                "sample_rate": self.FEATURE_SAMPLE_RATE,
-                "audio_preprocessor": self._object_state(audio_preprocessor),
-                "implementation": self._FEATURE_EXTRACTION_VERSION,
-            }
-        )
+        state: dict[str, object] = {
+            "base": self._cache_key(split, random_state),
+            "sample_rate": self.FEATURE_SAMPLE_RATE,
+            "audio_preprocessor": self._object_state(audio_preprocessor),
+            "implementation": self._FEATURE_EXTRACTION_VERSION,
+        }
+        if audio_dir is not None:  # added only when used, so existing cache keys stay valid
+            state["audio_dir"] = self._object_state(Path(audio_dir))  # files, sizes, mtimes
+        return self._hash_state(state)
 
     def _builder_state(self) -> dict[str, object]:
         return {

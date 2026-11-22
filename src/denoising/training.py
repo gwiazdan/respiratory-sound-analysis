@@ -81,7 +81,9 @@ class TrainingRecipe:
     source: ClassVar[str] = "domyślny przepis: L1 na fali, Adam, stałe lr"
     batch_size: ClassVar[int] = 16
     lr: ClassVar[float] = 1e-4
-    epochs: ClassVar[int] = 30
+    #: 50 epochs for every model, as in the project's runs (the validation SI-SDR of
+    #: Wave-U-Net and MANNER levels off around epoch 45)
+    epochs: ClassVar[int] = 50
 
     def __init__(self, network: DenoisingModel) -> None:
         self.sample_rate = network.sample_rate
@@ -114,13 +116,18 @@ class TrainingRecipe:
 
 
 class WaveUNetRecipe(TrainingRecipe):
-    """Stoller et al. (2018): Adam lr 1e-4, batch 16; L1 on the waveform.
+    """Stoller et al. (2018): Adam lr 1e-4; L1 on the waveform.
 
     The loss is computed on the peak-normalised signal the network actually sees (the same
     scaling as :meth:`WaveUNet.enhance`), optionally with a multi-resolution STFT term.
+    Batch 64 (the paper used 16) and 50 epochs are the settings of the project's run.
     """
 
-    source = "Stoller i in. (2018): Adam, lr 1e-4, batch 16; L1 na fali po normalizacji szczytu"
+    source = (
+        "Stoller i in. (2018): Adam, lr 1e-4, L1 na fali po normalizacji szczytu; "
+        "batch 64 i 50 epok jak w naszych przebiegach"
+    )
+    batch_size = 64
 
     def __init__(self, network: DenoisingModel, stft_loss_weight: float = 0.0) -> None:
         if not isinstance(network, WaveUNet):
@@ -149,21 +156,22 @@ class MANNERRecipe(TrainingRecipe):
 
     - loss: L1 + multi-resolution STFT loss (factors 0.5/0.5) for both the clean estimate and
       the removed noise, mixed per example by the clean-energy ratio (``WeightedLoss``),
-    - Adam with OneCycleLR (``max_lr=1e-3``), batch size 4.
+    - Adam with OneCycleLR (``max_lr=1e-3``); the official batch size is 4.
 
-    The official run uses 350 epochs on VoiceBank+DEMAND; the default here is 30, which is the
-    budget Tzeng et al. (2025) used for training from scratch. For fine-tuning the official
+    The official run uses 350 epochs on VoiceBank+DEMAND, Tzeng et al. (2025) trained for 30
+    epochs from scratch. The defaults here, batch 32 and 50 epochs, are the settings of the
+    project's best run (batch 8 is about 3x slower per epoch). For fine-tuning the official
     pretrained weights they used lr 5e-5 for 20 epochs (set ``lr`` and ``epochs`` and pass
     ``one_cycle=False`` for a constant lr).
     """
 
     source = (
         "oficjalny kod MANNER: L1 + MR-STFT (0,5/0,5) dla mowy i szumu z wagą energii, "
-        "Adam + OneCycleLR (max lr 1e-3), batch 4"
+        "Adam + OneCycleLR (max lr 1e-3); batch 32 i 50 epok jak w naszych przebiegach "
+        "(oryginał: batch 4)"
     )
-    batch_size = 4
+    batch_size = 32
     lr = 1e-3  # peak learning rate of OneCycleLR
-    epochs = 30
 
     def __init__(self, network: DenoisingModel, one_cycle: bool = True) -> None:
         if not isinstance(network, MANNER):
@@ -225,8 +233,11 @@ class CMGANRecipe(TrainingRecipe):
       the metric-GAN term (MSE between the discriminator's score of the estimate and 1),
     - metric discriminator: MSE to 1 for (clean, clean) and to the normalised quality score
       for (clean, estimate); AdamW with twice the generator's lr,
-    - AdamW lr 5e-4, step decay x0.5, batch 4, random 2 s crops of every training segment
-      (``cut_len``), inputs scaled to unit RMS.
+    - AdamW lr 5e-4, step decay x0.5, random 2 s crops of every training segment
+      (``cut_len``), inputs scaled to unit RMS; batch 8 here (4 in the original).
+
+    CMGAN is slow: about 0.5 s per step at batch 8 on an RTX 4070 Ti SUPER, i.e. ~30 min per
+    full epoch of the project's data. ``TRAIN["max_steps"]`` in the notebook limits an epoch.
 
     Differences from the original, forced by the task:
 
@@ -245,12 +256,11 @@ class CMGANRecipe(TrainingRecipe):
 
     source = (
         "oficjalny kod CMGAN: 0,1·RI + 0,9·mag + 0,2·czas + 0,05·GAN, dyskryminator metryczny "
-        "z SI-SDR zamiast PESQ, AdamW lr 5e-4, spadek lr o połowę co 1/4 treningu, batch 4, "
-        "wycinki 2 s"
+        "z SI-SDR zamiast PESQ, AdamW lr 5e-4, spadek lr o połowę co 1/4 treningu, "
+        "wycinki 2 s; batch 8, 50 epok (oryginał: batch 4)"
     )
-    batch_size = 4
+    batch_size = 8
     lr = 5e-4
-    epochs = 30
 
     def __init__(
         self,
